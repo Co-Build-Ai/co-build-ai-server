@@ -58,7 +58,7 @@ elestiri_llm = ChatOpenAI(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VL
 
 
 PRD_PROMPT = PromptTemplate(
-    input_variables=["title", "raw_idea", "benzer_ornekler", "ek_baglam", "revize_notu"],
+    input_variables=["title", "raw_idea", "benzer_ornekler", "patent_kontrolu", "ek_baglam", "revize_notu"],
     template="""Sen deneyimli bir teknik ürün yöneticisisin. Aşağıdaki proje fikrini analiz et.
 
 Proje Başlığı: {title}
@@ -66,6 +66,9 @@ Ham Fikir: {raw_idea}
 {ek_baglam}
 Gerçek, var olan benzer projeler (referans amaçlı):
 {benzer_ornekler}
+
+Otomatik patent taraması sonuçları (referans amaçlı):
+{patent_kontrolu}
 {revize_notu}
 Şu formatta, TAM OLARAK bu sıralamayla cevap ver:
 
@@ -84,13 +87,16 @@ Gerçek, var olan benzer projeler (referans amaçlı):
 ## Benzer Örnekler ve Farklılaşma
 (Yukarıda verilen "gerçek, var olan benzer projeler" listesini kullan. Bunlardan en alakalı 1-2 tanesini belirt ve bu projenin onlardan nasıl farklılaşabileceğine dair somut öneriler sun. Eğer liste "Bulunamadı" diyorsa, "Veri tabanımızda doğrudan bir örnek bulunamadı, bu potansiyel bir avantaj olabilir" de.)
 
+## Patent/Özgünlük Kontrolü
+(Yukarıda verilen "otomatik patent taraması sonuçları"nı özetleyerek sun: bulunan benzer patentleri kısaca listele. Eğer sonuçlarda "YÜKSEK BENZERLİK UYARISI" geçiyorsa, MUTLAKA "Bu fikir mevcut bir patentle kavramsal olarak örtüşebilir, hukuki danışmanlık önerilir" uyarısını ekle. Böyle bir uyarı yoksa "Belirgin bir patent çakışması tespit edilmedi" de. BU SADECE OTOMATİK BİR ÖN KONTROLDÜR — kesin bir hukuki tespit veya iddia ÜRETME, sadece bir ön bulgu olduğunu belirt.)
+
 ## Tahmini Altyapı Maliyeti Kategorisi
 (Bu projenin altyapı ihtiyacını Düşük / Orta / Yüksek olarak kategorize et ve kısa bir gerekçe ver. Sonuna şu notu ekle: "Not: Bu, yapay zeka tarafından üretilen kaba bir tahmindir, gerçek maliyetler için bir teknik danışmana başvurulması önerilir.")
 
 ## Beceri Etiketleri
 (EN FAZLA 5 tane, bu projeye GERÇEKTEN özgü teknik beceri/teknoloji. Alternatifleri aynı anda listeleme, en olası tek birini seç. SADECE virgülle ayrılmış liste halinde yaz, başka hiçbir şey ekleme. Örnek: React Native, Node.js, PostgreSQL)
 
-ÇOK ÖNEMLİ: Yukarıdaki TÜM bölümleri (Ürün Özeti, Hedef Kullanıcı, Temel Özellikler, Teknik Gereksinimler, Benzer Örnekler ve Farklılaşma, Tahmini Altyapı Maliyeti Kategorisi, Beceri Etiketleri) EKSİKSİZ doldur. Hiçbir bölümü atlama veya kısa geçme. Her bölüm en az 2-3 cümle veya 3-4 madde içermeli.
+ÇOK ÖNEMLİ: Yukarıdaki TÜM bölümleri (Ürün Özeti, Hedef Kullanıcı, Temel Özellikler, Teknik Gereksinimler, Benzer Örnekler ve Farklılaşma, Patent/Özgünlük Kontrolü, Tahmini Altyapı Maliyeti Kategorisi, Beceri Etiketleri) EKSİKSİZ doldur. Hiçbir bölümü atlama veya kısa geçme. Her bölüm en az 2-3 cümle veya 3-4 madde içermeli.
 
 DİL KURALI (ÇOK ÖNEMLİ): PRD'nin TAMAMINI SADECE Türkçe yaz. Çince, İngilizce veya başka HİÇBİR dilden tek bir kelime, karakter veya cümle bile KULLANMA — cevabının tamamı baştan sona yalnızca Türkçe olmalı.""",
 )
@@ -105,14 +111,14 @@ PRD Taslağı:
 ---
 
 Şunları kontrol et:
-1. Şu 7 bölümün HEPSİ eksiksiz bulunmalı: "Ürün Özeti", "Hedef Kullanıcı",
+1. Şu 8 bölümün HEPSİ eksiksiz bulunmalı: "Ürün Özeti", "Hedef Kullanıcı",
 "Temel Özellikler" (en az 4 madde), "Teknik Gereksinimler", "Benzer Örnekler ve
-Farklılaşma", "Tahmini Altyapı Maliyeti Kategorisi", "Beceri Etiketleri"
-(virgülle ayrılmış, en fazla 5 teknik beceri; BOŞ OLAMAZ).
+Farklılaşma", "Patent/Özgünlük Kontrolü", "Tahmini Altyapı Maliyeti Kategorisi",
+"Beceri Etiketleri" (virgülle ayrılmış, en fazla 5 teknik beceri; BOŞ OLAMAZ).
 2. Metnin TAMAMI SADECE Türkçe olmalı — Çince, İngilizce veya başka bir dilden
 TEK BİR kelime/karakter bile geçmemeli. Böyle bir karışım varsa bu ciddi bir hatadır.
 
-Eğer yukarıdakilerin HEPSİ (7 bölüm eksiksiz VE metin tamamen Türkçe) doğruysa
+Eğer yukarıdakilerin HEPSİ (8 bölüm eksiksiz VE metin tamamen Türkçe) doğruysa
 SADECE şu tek kelimeyi yaz: ONAYLANDI
 Aksi halde "REVIZE:" ile başlayıp neyin eksik/hatalı olduğunu (dil karışımı dahil)
 kısaca (1-3 madde) listele. Başka hiçbir şey ekleme.""",
@@ -123,6 +129,7 @@ class PRDAgentState(TypedDict):
     title: str
     raw_idea: str
     benzer_ornekler: str
+    patent_kontrolu: str
     budget_type: Optional[str]
     sektor: Optional[str]
     prd_metni: str
@@ -208,6 +215,7 @@ async def _prd_uret_node(state: PRDAgentState) -> dict:
         title=state["title"],
         raw_idea=state["raw_idea"],
         benzer_ornekler=state["benzer_ornekler"],
+        patent_kontrolu=state.get("patent_kontrolu") or "Patent taraması yapılmadı.",
         ek_baglam=_ek_baglam_metni(state),
         revize_notu=revize_notu,
     )
@@ -313,6 +321,7 @@ async def prd_uret_ve_eslestir(
     title: str,
     raw_idea: str,
     benzer_ornekler: str,
+    patent_kontrolu: str = "",
     budget_type: Optional[str] = None,
     sektor: Optional[str] = None,
 ) -> dict:
@@ -328,6 +337,7 @@ async def prd_uret_ve_eslestir(
         "title": title,
         "raw_idea": raw_idea,
         "benzer_ornekler": benzer_ornekler,
+        "patent_kontrolu": patent_kontrolu,
         "budget_type": budget_type,
         "sektor": sektor,
         "prd_metni": "",

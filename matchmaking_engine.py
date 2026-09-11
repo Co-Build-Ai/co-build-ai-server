@@ -80,6 +80,12 @@ EMBEDDING_BOYUTU = 384  # all-MiniLM-L6-v2 çıktısı 384 boyutludur
 VARSAYILAN_TOP_K = 5
 BM25_ADAY_HAVUZU_BOYUTU = 200  # hibrit aramada BM25'in üzerinde çalışacağı aday sayısı
 
+# Tescilli Mucit Eşleştirme Çarpanı: profiles.has_verified_patent = true olan
+# geliştiricilerin hibrit (RRF) skoruna uygulanan çarpan (bkz.
+# supabase_migration_patent_carpan.sql). %15 bonus veriyoruz — ne sıralamayı
+# tek başına domine edecek kadar büyük, ne de anlamsız kalacak kadar küçük.
+PATENT_CARPAN = 1.15
+
 
 # ============================================================================
 # Hata sınıfları — çağıran kod (FastAPI endpoint'leri) bunları try/except ile
@@ -464,6 +470,37 @@ def _tum_gelistirici_havuzunu_getir(
     return yanit.data or []
 
 
+def _patentli_gelistiricileri_getir(developer_idler: list[str]) -> set[str]:
+    """
+    Verilen developer_id'ler arasından `profiles.has_verified_patent = true`
+    olanların id kümesini döner (bkz. PATENT_CARPAN, supabase_migration_patent_carpan.sql).
+
+    Migration henüz çalıştırılmamışsa (kolon yok) sessizce boş küme döner —
+    yani çarpan hiç kimseye uygulanmaz, mevcut davranış bozulmaz (geriye
+    dönük uyumluluk). Bu, diğer opsiyonel alanlarla (budget_type/sektor)
+    aynı savunmacı desen.
+    """
+    if not developer_idler:
+        return set()
+    try:
+        supabase = _supabase_client_getir()
+        yanit = (
+            supabase.table("profiles")
+            .select("id, has_verified_patent")
+            .in_("id", developer_idler)
+            .eq("has_verified_patent", True)
+            .execute()
+        )
+        return {satir["id"] for satir in (yanit.data or [])}
+    except Exception as exc:
+        logger.warning(
+            "Patent doğrulama bilgisi alınamadı (muhtemelen migration çalıştırılmadı), "
+            "çarpan bu turda uygulanmayacak: %s",
+            exc,
+        )
+        return set()
+
+
 def hibrit_eslestirme_yap(
     prd_metni: str,
     gerekli_diller: Optional[list[str]] = None,
@@ -537,6 +574,12 @@ def hibrit_eslestirme_yap(
 
         # --- 3) Reciprocal Rank Fusion ile birleştir ----------------------
         tum_developer_idler = set(semantik_sira) | set(bm25_sira)
+        # Tescilli Mucit Eşleştirme Çarpanı: top_k seçilmeden ÖNCE uyguluyoruz
+        # ki doğrulanmış patenti olan bir geliştirici, sırf çarpan sayesinde
+        # top_k'ya girebilsin — sadece görüntülenen skoru değil, gerçek
+        # sıralamayı etkilemesi gerekiyor.
+        patentli_idler = _patentli_gelistiricileri_getir(list(tum_developer_idler))
+
         rrf_skorlari: dict[str, float] = {}
         for dev_id in tum_developer_idler:
             skor = 0.0
@@ -544,6 +587,8 @@ def hibrit_eslestirme_yap(
                 skor += 1.0 / (_RRF_K + semantik_sira[dev_id])
             if dev_id in bm25_sira:
                 skor += 1.0 / (_RRF_K + bm25_sira[dev_id])
+            if dev_id in patentli_idler:
+                skor *= PATENT_CARPAN
             rrf_skorlari[dev_id] = skor
 
         siralanmis_idler = sorted(rrf_skorlari, key=rrf_skorlari.get, reverse=True)[:top_k]
