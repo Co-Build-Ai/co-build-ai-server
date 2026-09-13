@@ -7,6 +7,7 @@ __pycache__/
 # --- Buyuk veri / uretilen artefaktlar ---
 chroma_data/
 startups.xlsx
+hf_cache/
 
 # --- Ortam degiskenleri ---
 # Gercek sirlar ASLA commit'lenmez. Sadece .env.example sablonu takip edilir.

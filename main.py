@@ -20,6 +20,15 @@ logger = logging.getLogger("cobuild.main")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 chroma_client = chromadb.PersistentClient(path="./chroma_data")
 startup_collection = chroma_client.get_or_create_collection(name="startup_ornekleri")
+# Patent koleksiyonu: cosine benzerliği kullanıyoruz ki eşik kontrolü
+# (PATENT_BENZERLIK_ESIGI) doğrudan "1 - mesafe" ile hesaplanabilsin.
+# Bkz. patent_veri_yukle.py — aynı ayarla oluşturulmalı.
+patent_collection = chroma_client.get_or_create_collection(
+    name="patent_ornekleri",
+    metadata={"hnsw:space": "cosine"},
+)
+
+PATENT_BENZERLIK_ESIGI = 0.75  # cosine benzerliği bu değeri aşarsa "yüksek benzerlik" uyarısı
 
 
 def benzer_ornekleri_bul(raw_idea: str, n_results: int = 3) -> str:
@@ -41,6 +50,53 @@ def benzer_ornekleri_bul(raw_idea: str, n_results: int = 3) -> str:
         ornekler.append(f"- {isim} ({sektor}): {kisa_aciklama}")
 
     return "\n".join(ornekler)
+
+
+def patent_cakismasi_kontrol_et(raw_idea: str, n_results: int = 3) -> str:
+    """
+    Kullanıcının fikrini `patent_ornekleri` koleksiyonunda (bkz.
+    patent_veri_yukle.py) arar ve en yakın patentleri, varsa "yüksek
+    benzerlik" uyarısıyla birlikte metin olarak döner.
+
+    ÖNEMLİ: Bu SADECE otomatik, kaba bir ön kontroldür — kesin bir hukuki
+    tespit/iddia ÜRETMEZ. Gerçek bir patent çakışması değerlendirmesi için
+    her zaman bir patent avukatına/vekiline danışılmalıdır.
+    """
+    if patent_collection.count() == 0:
+        return "Patent veri seti henüz yüklenmemiş (bkz. patent_veri_yukle.py)."
+
+    query_embedding = embedding_model.encode([raw_idea]).tolist()
+    results = patent_collection.query(
+        query_embeddings=query_embedding,
+        n_results=n_results,
+    )
+
+    if not results["documents"] or not results["documents"][0]:
+        return "İlgili bir patent bulunamadı."
+
+    satirlar = []
+    en_yuksek_benzerlik = 0.0
+    for doc, meta, mesafe in zip(
+        results["documents"][0], results["metadatas"][0], results["distances"][0]
+    ):
+        # Koleksiyon cosine uzayında oluşturulduğu için: benzerlik = 1 - mesafe
+        benzerlik = 1 - mesafe
+        en_yuksek_benzerlik = max(en_yuksek_benzerlik, benzerlik)
+        patent_no = meta.get("patent_number", "Bilinmeyen")
+        baslik = meta.get("title", "Başlıksız")
+        kisa_ozet = doc[:200] + ("..." if len(doc) > 200 else "")
+        satirlar.append(
+            f"- Patent No: {patent_no} | {baslik} (benzerlik: {benzerlik:.2f})\n  {kisa_ozet}"
+        )
+
+    sonuc = "\n".join(satirlar)
+    if en_yuksek_benzerlik > PATENT_BENZERLIK_ESIGI:
+        sonuc += (
+            f"\n\nYÜKSEK BENZERLİK UYARISI: En yakın patentle benzerlik oranı "
+            f"{en_yuksek_benzerlik:.2f} — eşik değeri ({PATENT_BENZERLIK_ESIGI}) aşıldı."
+        )
+
+    return sonuc
 
 
 class FikirRequest(BaseModel):
@@ -85,11 +141,13 @@ async def prd_is_akisini_calistir(
 ):
     try:
         benzer_ornekler = await asyncio.to_thread(benzer_ornekleri_bul, raw_idea)
+        patent_kontrolu = await asyncio.to_thread(patent_cakismasi_kontrol_et, raw_idea)
 
         sonuc = await prd_agent.prd_uret_ve_eslestir(
             title=title,
             raw_idea=raw_idea,
             benzer_ornekler=benzer_ornekler,
+            patent_kontrolu=patent_kontrolu,
             budget_type=budget_type,
             sektor=sektor,
         )
