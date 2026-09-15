@@ -41,6 +41,9 @@ from __future__ import annotations
 import os
 import sys
 
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -65,11 +68,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def yazilimcilari_getir() -> list[dict]:
-    """profiles tablosundan sadece yazılımcı (developer) tipindeki kayıtları çeker."""
+    """profiles tablosundan yazılımcı olarak hareket edebilen kayıtları çeker.
+
+    Not: `user_type = 'both'` (dual-role) hesaplar da yazılımcı olarak eşleşme
+    havuzuna girmeli — sadece 'developer' filtrelemek bu hesapları atlıyordu.
+    """
     yanit = (
         supabase.table("profiles")
         .select("id, full_name, bio, skills")
-        .eq("user_type", "developer")
+        .in_("user_type", ["developer", "both"])
         .execute()
     )
     return yanit.data or []
