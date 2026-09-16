@@ -1,188 +1,123 @@
-# Co-Build AI — CLAUDE.md (En Güncel, v4)
+# Co-Build AI Server — CLAUDE.md (v5, 2026-09-16)
 
-Bu dosya Claude Code oturumlarında otomatik okunur. Projenin ne olduğunu, mimarisini, tamamlanan işleri ve bekleyen işleri özetler. Claude Code, bu dosyayı okuduktan sonra kısaca özetleyip kullanıcıdan (Esma) onay almalı.
-
-**v4 notu:** Bu revizyon, hem `co-build-ai-server` hem `co-build-ai` (web) reposundaki gerçek kod okunarak hazırlandı (2026-09-15). v3'te "planlanıyor" / "kısmen başladı" denen **Patent RAG + Tescilli Mucit Çarpanı** ve **Dual-Role sistemi** aslında uçtan uca (backend + veritabanı + web UI) tamamlanmış durumda — kod, dokümantasyondan ileride kalmıştı. Ayrıca `co-build-ai/app/CLAUDE.md` adında, web tarafının kod-seviyesi güncel bir alt-özeti var; çelişki olursa bu kök dosya esas alınır ama alt dosya da faydalı bir günlük.
+Bu dosya Claude Code oturumlarında otomatik okunur. **v5 notu:** Bu revizyon, tüm dosyalar tek tek okunarak ve gerçek `git log` ile hazırlandı. Önceki sürümün iddia ettiği bazı "düzeltildi" notları **doğru değildi** (aşağıda işaretlendi) — bir sonraki oturumda bu dosyaya da körü körüne güvenme, özellikle "düzeltildi" notlarını tekrar doğrula.
 
 ## 1. Proje Nedir
 
-**Co-Build AI**: Teknik bilgisi olmayan fikir sahiplerini (founder) yazılımcılarla (developer) buluşturan bir pazar yeri platformu. Fikir sahibi projesini kendi cümleleriyle yazıyor, bir AI bunu profesyonel bir PRD'ye (teknik şartname) çeviriyor + gereken beceri etiketlerini çıkarıyor. Yazılımcılar bu projeleri keşfediyor, fikir sahipleri de yazılımcı profillerini keşfediyor.
+`co-build-ai` (Next.js) platformunun AI servisi: ham fikri PRD'ye çeviren LangGraph agent'ı, patent RAG ön-kontrolü, ve geliştirici/proje eşleştirme motorunu barındıran FastAPI uygulaması. Kapsamlı proje özeti için `co-build-ai` reposundaki kök `CLAUDE.md` (v5)'e bak — burada sadece bu repoya özel detaylar var.
 
-## 2. Kullanıcı Profili
+## 2. `main.py` — FastAPI Uygulaması
 
-Esma — Python/ML deneyimli, web geliştirmede orta seviyeye ulaşmış (proje ilerledikçe öğrendi). Windows kullanıyor. Berna ile birlikte geliştiriyor. Adım adım, gerekçeli açıklamalarla ilerlemeyi tercih ediyor.
+**Endpoint'ler (doğrudan main.py'de):**
+- `GET /` — health check
+- `POST /prd-uret-baslat` — `{project_id, title, raw_idea, budget_type?, sektor?}` alır, asenkron kuyruğa ekler, `{"status":"started","kuyruk_sirasi":N}` döner
+- `GET /prd-durum/{project_id}` — `job_store` dict'inden durumu okur
 
-## 3. AI Altyapısı: RunPod/vLLM (Ollama DEĞİL)
+Ayrıca `app.include_router(eslestirme_router)` ile `eslestirme_endpoints.py`'deki 5 endpoint mount ediliyor (bkz. Bölüm 5).
 
-Proje başlangıçta Ollama + Llama 3.1 8B ile yerel/CPU tabanlı çalışıyordu, **bu değişti**: CPU'da PRD üretimi çok yavaştı (1-5 dakika) ve Türkçe kalitesi zayıftı.
+**Kuyruk mekanizması:** tek bir `asyncio.Queue` (`istek_kuyrugu`) + `lifespan()` içinde başlatılan tek bir arka plan worker (`kuyruk_isleyici()`), işleri **sırayla tek tek** işliyor. Sonuçlar `job_store: dict[str, dict]` içinde — **bellek-içi, kalıcı değil**, sunucu restart'ında kaybolur.
 
-### Güncel AI Altyapısı
-- **Model:** `Qwen/Qwen2.5-32B-Instruct-AWQ` (çok dillilik/Türkçe kalitesi için Llama'dan geçildi)
-- **Motor:** vLLM — OpenAI-uyumlu API sunuyor (`/v1/chat/completions`)
-- **Donanım:** RunPod'da kiralanan bir GPU sunucusu (RTX 4090, 24GB VRAM), saatlik ücretlendirme (~$0.75/saat)
-- **Template:** RunPod'da "Runpod Pytorch 2.8.0" template'i, CUDA 12.8+ filtresiyle deploy edilmeli (filtresiz kiralamada "NVIDIA driver too old" hatası gerçekten yaşandı)
-- **Kalıcı depo:** Pod'un container disk'i geçicidir (restart'ta sıfırlanabilir, gerçekten yaşandı). vLLM kurulumu ve model dosyaları **`/workspace` altında** (Network Volume, kalıcı):
-  - Sanal ortam: `/workspace/vllm_env`
-  - HF önbelleği: `/workspace/.cache/huggingface/`
-- **Pod her yeniden başladığında** (Stop/Start sonrası) terminalde:
-  ```bash
-  cd /workspace
-  source vllm_env/bin/activate
-  vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ --quantization awq --max-model-len 4096 --gpu-memory-utilization 0.90
-  ```
-- **Bilinen risk:** RunPod bazen "Pod resume failed: not enough free GPUs on host machine" hatası verebiliyor (geçici, birkaç dakika sonra tekrar denenerek çözüldü). Sunum günü Pod'u en az 1-2 saat önce açıp hazır tutmak öneriliyor.
-- **Maliyet:** İş bitince Pod **Stop** edilmeli; kalıcı depo sayesinde tekrar Start'ta sadece `vllm serve ...` yeterli.
-- **Canlı testte ölçülen süre:** tüm döngü (üretim + öz-eleştiri + eşleştirme) ~35 saniyede tamamlanıyor — `main.py`'deki 5 dakikalık `JOB_TIMEOUT_SECONDS` bol bol yeterli bir pay.
+**Timeout:** her istek için ayrı bir `asyncio.create_task` (`timeout_kontrolcusu`), `JOB_TIMEOUT_SECONDS = 300` (5 dk) sonra hâlâ `"processing"` ise zorla `"error"` yapıyor. İş zaten bitmişse bu task sessizce no-op olur (iptal edilmiyor ama zararsız).
 
-### `.env` Değişkenleri (`co-build-ai-server`)
-```
-VLLM_BASE_URL=https://[pod-id]-8000.proxy.runpod.net/v1
-VLLM_API_KEY=EMPTY
-VLLM_MODEL_ADI=Qwen/Qwen2.5-32B-Instruct-AWQ
-```
-`VLLM_BASE_URL`, Pod yeniden deploy edilince (yeni Pod oluşursa) değişir — güncel URL RunPod panelinden (Connect → Port 8000 → HTTP Service) alınıp hem `.env` (server) hem `co-build-ai`'deki `NEXT_PUBLIC_AI_SERVICE_URL` (web) güncellenmeli. Kod bu değerleri `os.getenv()` ile okuyor, hardcode yok.
+**CORS:** tamamen açık (`allow_origins=["*"]`).
 
-### İkinci Bilgisayara (Wi-Fi Eşleşmesine) Gerek Yok
-RunPod internet üzerinden erişilebilir, hangi ağda olursa olsun bağlanılabiliyor. Next.js ve FastAPI aynı bilgisayarda çalışabilir (opsiyonel, teorik engel yok).
+**ChromaDB koleksiyonları (main.py'de açılıyor):** `startup_ornekleri` (varsayılan mesafe metriği, cosine DEĞİL — `veri_yukle.py` ile tutarlı ama `patent_ornekleri`'nden farklı) ve `patent_ornekleri` (`hnsw:space: cosine` açıkça belirtilmiş).
 
-## 4. PRD Üretim Akışı — Artık Tek Prompt Değil, LangGraph Self-Reflection Döngüsü
+**Patent kontrolü akışı:** `patent_cakismasi_kontrol_et()` main.py'de, graph'tan ÖNCE çağrılıyor, sonucu düz metin olarak PRD prompt'una enjekte ediliyor (bkz. kök CLAUDE.md Bölüm 5).
 
-`prd_agent.py` — ham fikirden PRD üretimi bir LangGraph durum makinesiyle yapılıyor:
+## 3. `prd_agent.py` — LangGraph Self-Reflection Döngüsü
 
-```
-prd_uret --> elestir --(onaylandı ya da 2. deneme)--> eslestir --> END
-    ^                        |
-    +-- (revize gerekli) ----+
-```
+Detaylar için kök `CLAUDE.md` Bölüm 5'e bak. Ek teknik notlar:
+- İki ayrı `ChatOpenAI` client: `llm` (max_tokens=1024, üretim için), `elestiri_llm` (max_tokens=300, öz-eleştiri için). İkisi de aynı `VLLM_*` env değişkenlerini okuyor.
+- `_YABANCI_ALFABE_RE`: CJK/Kana/Hangul/Kiril Unicode aralıklarını yakalayan regex, LLM'e sormadan önce çalışıyor.
+- `_skills_ve_prd_ayikla`: virgülle ayrılmış ve madde-işaretli listeleri parse ediyor, `MAKS_SKILLS = 8` (prompt ≤5 istiyor, küçük bir tutarsızlık).
 
-- En fazla 2 üretim denemesi (ilk üretim + en fazla 1 düzeltme) — `iteration >= 2` olduğunda öz-eleştiri sonucu ne olursa olsun akış devam eder, sonsuz döngü yok.
-- Öz-eleştiri hem LLM'e soruyor (8 bölümün tamamlığı + dil saflığı) hem de ayrıca bir regex ile (`_YABANCI_ALFABE_RE`) Çince/Kiril/Korece karakter sızmasını LLM'e güvenmeden kesin tespit ediyor.
-- `elestir` düğümünden sonra `eslestir` düğümü otomatik olarak `matchmaking_engine.hibrit_eslestirme_yap` çağırıp önerilen geliştiricileri de aynı akışta döndürüyor — `main.py` artık ayrıca eşleştirme çağırmıyor, `prd_uret_ve_eslestir()` sonucu hem PRD hem `onerilen_gelistiriciler` içeriyor.
-- Veri gizliliği: dış API (OpenAI/Anthropic vb.) yok, sadece kendi RunPod GPU'muzdaki vLLM.
+## 4. `matchmaking_engine.py`
 
-### PRD İçeriği (Prompt Yapısı)
-Tek birleşik prompt: Ürün Özeti, Hedef Kullanıcı, Temel Özellikler, Teknik Gereksinimler, Benzer Örnekler ve Farklılaşma, **Patent/Özgünlük Kontrolü** (bkz. Bölüm 6), Tahmini Altyapı Maliyeti Kategorisi, Beceri Etiketleri. Ayrıştırma (`_skills_ve_prd_ayikla`) birden fazla format dener çünkü model beceri başlığını tutarsız yazabiliyor (numaralı liste, farklı başlık ifadesi vb.) — bilinen bir kusur, tamamen çözülmedi.
+- `en_uygun_gelistiricileri_bul()` — semantik arama, `HuggingFaceEmbeddings(all-MiniLM-L6-v2, normalize_embeddings=True)`, Supabase RPC `match_developers`.
+- `hibrit_eslestirme_yap()` — semantik top-20 + BM25 (tüm havuz, `_tum_gelistirici_havuzunu_getir`, max `BM25_ADAY_HAVUZU_BOYUTU=200`), RRF (`_RRF_K=60`).
+- `PATENT_CARPAN = 1.15` — RRF skoruna, `sorted()[:top_k]` seçiminden ÖNCE uygulanıyor (satır ~726). `_patentli_gelistiricileri_getir()` `profiles.has_verified_patent`'i okuyor, migration yoksa sessizce boş küme + uyarı log'u (geriye dönük uyumlu).
+- `uyum_skorlarini_hesapla_ve_ata()` — hibrit skor varsa 65-98'e, yoksa ham kosinüs benzerliği 0-100'e ölçekleniyor.
+- `filtre_metadata` (`budget_type`/`sektor`) — RPC'ye `filter_budget_type`/`filter_sektor` olarak geçiyor, boşsa atlanıyor.
+- **`developer_embeddings` tablosu:** developer_id, full_name, skills, bio, kaynak_metin, embedding(384), opsiyonel budget_type/sektor. Upsert: `gelistirici_profilini_vektorle()`.
+- **⚠️ `project_embeddings` tablosu da burada yönetiliyor** (önceki dokümantasyonda hiç yoktu): `proje_profilini_vektorle()` / `en_uygun_projeleri_bul()`, RPC `match_projects`. Bu, geliştiricinin "bana uygun proje bul" aramasını besliyor. Toplu karşılığı: `projeleri_toplu_vektorle.py` (status='published' tüm projeleri vektörler).
+- `EMBEDDING_BOYUTU = 384` sabit.
 
-## 5. Web Tarafı (Next.js — `co-build-ai` reposu)
+## 5. `eslestirme_endpoints.py` — 5 Endpoint (Önceki Dokümantasyonda 3 Deniyordu)
 
-- Next.js 16, App Router, TypeScript, Tailwind CSS v4
-- Supabase: PostgreSQL + Authentication + RLS
-- Tasarım paleti defalarca değişti (bkz. `co-build-ai/app/CLAUDE.md` → "Tasarım Geçmişi"); **güncel**: açık mavi zemin (`blue-50`) + beyaz/açık mavi sidebar + "bebek mavisi" (`blue-200`) vurgulu kartlar. Token isimleri (`bg-coral`, `text-ink` vb.) sabit kaldı, hex değerleri `globals.css`'teki `@theme` bloğunda sık değişti — class ismine değil gerçek hex'e güven.
+1. `POST /gelistirici/vektorle`
+2. `POST /eslestir/semantik-top5`
+3. `POST /eslestir/hibrit`
+4. `POST /proje/vektorle` — **YENİ dokümante edildi**, proje ilanını vektörler
+5. `POST /eslestir/proje-top5` — **YENİ dokümante edildi**, yayınlanmış projelerde semantik arama (geliştirici → proje yönü)
 
-### Dashboard Yapısı
-`(dashboard)` route group altında sidebar + topbar düzeni (TailAdmin referanslı):
-```
-app/(dashboard)/
-  ayarlar/ (tercihler, bildirimler, guvenlik, hesap, tehlikeli-bolge)
-  panel/ (developer-projects.tsx, founder-developers.tsx, quick-match.tsx, direct-search.tsx)
-  profil/ (edit-profile.tsx, [id]/page.tsx)
-  mesajlar/
-  projelerim/ (aktif, kabul-ettiklerim, teklifler, yururlukte)
-  yildizlarim/
-  layout.tsx
-app/components/
-  sidebar.tsx, topbar.tsx, notification-bell.tsx, role-switcher.tsx,
-  project-match-card.tsx, project-progress-card.tsx, rate-offer-form.tsx,
-  rating-stars.tsx, stat-circle.tsx, trending-widget.tsx, availability-badge.tsx,
-  progress-ring.tsx, avatar.tsx, chat-box.tsx, logout-button.tsx, github-repo-badge.tsx
-app/lib/roles.ts
-app/proje/[id]/
-  developer-project-view.tsx, offers-list.tsx, payment-section.tsx
-```
+## 6. Patent RAG Veri Yükleme (`patent_veri_yukle.py`)
 
-### Dual-Role (Çift Rol) Sistemi — TAMAMLANDI (v3'te "kısmen başladı" deniyordu, artık geçersiz)
-Kullanıcının hem founder hem developer olabilmesi özelliği **uçtan uca çalışıyor**, prototip değil:
-- `profiles.user_type`: `"founder" | "developer" | "both"`; `profiles.active_role`: `"founder" | "developer"` (sadece `"both"` hesaplar için anlamlı — hangi modda gezindiğini tutar)
-- Kayıt formunda (`app/kayit-ol/page.tsx`) "both" seçeneği var, seçilince `active_role: "founder"` ile başlıyor
-- `app/lib/roles.ts`: `getActiveRole`, `canActAsDeveloper`, `canActAsFounder` yardımcıları
-- `role-switcher.tsx`: sidebar'da mod değiştirme, Supabase'e `active_role` yazıyor, `router.refresh()`
-- 17 dosyada kullanılıyor (panel, profil, projelerim/*, layout, quick-match, founder-developers, direct-search, yildizlarim) — yani gerçek, yaygın bir bağımlılık, izole bir deney değil
+- Kaynak: HuggingFace `HUPD/hupd`. Filtre: CPC/IPC kodu `G06F` veya `G06N` ile başlıyor + boş olmayan özet. Hedef: 3000-5000 kayıt (`HEDEF_MIN_KAYIT`/`HEDEF_MAKS_KAYIT`).
+- Üç mod: varsayılan (`sample` config), `--yil YYYY` (tek yılın küçük dosyasını doğrudan indirir, script'in kendi önerdiği yöntem), `--tam` (57.5GB, interaktif onay gerekir, pratik değil).
+- `datasets==2.19.0` bilerek sabit — daha yeni sürüm HUPD'nin eski "loading script" yöntemini kırıyor.
+- ChromaDB koleksiyonu: `patent_ornekleri` (`hnsw:space: cosine`).
+- **Gerçek kayıt sayısı kod/yorumlarda doğrulanabilir değil** — sadece hedef aralık (3000-5000) var, "şu an X kayıt var" gibi iddialar ölçülmüş gerçek değil, tahmindir.
 
-## 6. Patent RAG + Tescilli Mucit Çarpanı — TAMAMLANDI (v3'te "planlanıyor" deniyordu, artık geçersiz)
+## 7. Startup RAG Verisi (`veri_yukle.py`)
 
-Bu özellik **hem AI servisinde hem veritabanında hem web arayüzünde tam olarak uygulanmış**:
+`startups.xlsx` (sheet "main", kolonlar: Startups Name/description/industry), boş/kısa (<30 karakter) açıklamalar atılıyor, ilk 1500 satırla sınırlı (`df.head(1500)`, gerçek bir üst sınır, sadece açıklama değil). ChromaDB koleksiyonu: `startup_ornekleri`.
 
-1. **Veri seti:** Hugging Face `HUPD/hupd` (Harvard USPTO Patent Dataset), G06F/G06N sınıflı, `patent_veri_yukle.py` ile indirilip embed'leniyor → ayrı ChromaDB koleksiyonu `patent_ornekleri` (cosine similarity ile oluşturulmuş, bkz. `main.py`).
-   - `--yil YIL` seçeneği (örn. `--yil 2016`) tek bir yılın küçük dosyasını indirip 3000-5000 hedef kayıt sayısına ulaşıyor; `--tam` 57.5GB'lık tüm arşivi indirir (pratik değil).
-   - `datasets==2.19.0` sabitlenmiş — daha yeni sürüm HUPD'nin eski tip "loading script" yüklemesini kırıyor, YÜKSELTME.
-2. **Patent çakışma kontrolü:** `main.py` içindeki `patent_cakismasi_kontrol_et()`, fikri `patent_ornekleri`'nde arar, `PATENT_BENZERLIK_ESIGI = 0.75` üzeri benzerlikte "YÜKSEK BENZERLİK UYARISI" ekliyor. PRD promptunda `## Patent/Özgünlük Kontrolü` bölümü olarak sunuluyor — kesin hukuki iddia üretmiyor, sadece ön bulgu + gerekirse hukuki danışmanlık önerisi.
-3. **Tescilli Mucit Çarpanı:** `profiles.has_verified_patent` (boolean) sütunu var (`supabase_migration_patent_carpan.sql`). `matchmaking_engine.py`'de `PATENT_CARPAN = 1.15` — bu true olan geliştiricilerin RRF skoruna top_k seçilmeden ÖNCE uygulanıyor (yani gerçekten sıralamayı etkiliyor, sadece görünen skoru değil). Web tarafında `has_verified_patent` 7 dosyada kullanılıyor (profil, edit-profile, quick-match, founder-developers, direct-search vb.).
-4. Kapsam kasıtlı olarak sınırlı: gerçek zamanlı, resmi patent ofisi entegrasyonu DEĞİL — statik bir veri seti üzerinden RAG tabanlı bir ön-kontrol prototipi.
-5. Patent verisi indirme/embedding CPU'da çalışır, GPU/vLLM gerektirmez — RunPod Pod'u kapalıyken de yapılabilir. Sadece gerçek PRD/patent testi için Pod açık olmalı.
+## 8. Demo/Sunum Script'leri — Tam Envanter
 
-## 7. Eşleştirme Motoru (`matchmaking_engine.py` / `eslestirme_endpoints.py`)
+Hepsi aynı güvenlik desenini kullanır: `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` zorunlu, şablon değer kontrolü, sır maskeleme, `EVET` yazarak onay (ya da `DEMO_SEED_ONAY=true`).
 
-- **Semantik arama:** `en_uygun_gelistiricileri_bul()` — PRD metnini `sentence-transformers/all-MiniLM-L6-v2` ile embed'leyip Supabase/pgvector'de (`match_developers` RPC) kosinüs benzerliğine göre top_k getirir.
-- **Hibrit arama:** `hibrit_eslestirme_yap()` — semantik + BM25 (`rank_bm25`) sonuçlarını Reciprocal Rank Fusion (RRF, k=60) ile birleştirir; PRD'den çıkarılan beceri etiketleri BM25 sorgusuna ağırlıklandırılarak ekleniyor.
-- **Skor normalizasyonu ÇÖZÜLDÜ (v3'te "0.03 gibi anlamsız değerler üretebiliyor" deniyordu):** `uyum_skorlarini_hesapla_ve_ata()` fonksiyonu, dönen sonuç kümesi içinde ham `hibrit_skor`'u 65-98 aralığına, ham `benzerlik_skoru`'nu (semantik-only durumda) 0-100'e ölçekleyip `uyum_skoru` alanına yazıyor — arayüz artık bu alanı doğrudan "%X uyum" olarak gösterebilir.
-- `filtre_metadata` (`budget_type`, `sektor`) ile ön-filtreleme opsiyonel; migration çalıştırılmamış ortamlarda geriye dönük uyumlu şekilde sessizce atlanıyor.
-- Endpoint'ler: `POST /gelistirici/vektorle`, `POST /eslestir/semantik-top5`, `POST /eslestir/hibrit`.
+| Script | Ne yapar | Dokunduğu hesaplar |
+|---|---|---|
+| `demo_kullanici_uret.py` | `demo_veri.json`'dan temel seed: yazılımcı+girişimci+proje, sahte CV/sertifika PDF | `demo.yazilimci{i}@...`, `demo.girisimci{i}@...` |
+| `demo_zengin_veri_uret.py` | "Zengin" set: 10 yazılımcı (3'ü patentli), 5 girişimci, 10 proje (şablon PRD, gerçek LLM çağrısı yok), teklifler + karşılıklı rating | `zengin.dev{i}@...`, `zengin.founder{i}@...` |
+| `demo_bos_profil_doldur.py` | İsimsiz test hesaplarına (full_name eşleşmesiyle) bio/skill/CV/portfolyo doldurur | "deneme deneme", "yıldız koz", "Dual Test Kullanici", "dual hesap", "ikiz", "ikiz yıldız", "ceren soyak", "deneme4yazilimci" (sadece portfolyo, bio/skill'i korunur) |
+| `demo_isim_degistir.py` | Yukarıdaki placeholder isimleri gerçekçi Türkçe isimlere çevirir, CV/sertifika PDF'lerini yeni isimle yeniden üretir | deneme deneme→Efe Karaca, deneme4yazilimci→Yusuf Güler, **yıldız koz→Bora Aydın**, Dual Test Kullanici→Cansu Erdoğan, dual hesap→Tuna Eren, ikiz→Mert Sönmez, ceren soyak→Melis Soysal |
+| `demo_patent_arttir.py` | 4 hesaba patent ekler (has_verified_patent + PDF) | Selin Yıldız, Onur Kurt, Deniz Koç, Mehmet Demir |
+| `demo_patent_basliklarini_doldur.py` | `patent_title` kolonunu geriye dönük doldurur | Selin Yıldız, Onur Kurt, Deniz Koç, Mehmet Demir, **Bora Aydın**, Deniz Aydemir, Kaan Yıldırım, Zeynep Kaya |
+| `demo_pdf_fontlarini_duzelt.py` | TÜM mevcut CV/patent/sertifika PDF'lerini Arial (Türkçe karakter destekli) fontla, URL'den path çözerek aynı yere yeniden üretir | cv_url/patent_url'i olan her profil + her certificate portfolio öğesi |
+| `demo_bora_aydin_zenginlestir.py` | **Tek kişiye özel, hardcoded UUID:** birincil patent + ikincil patent (certificate-as-patent) + 4 AI/sinyal işleme/pazarlama projesi | **Bora Aydın** (`f934028e-8115-4dfb-a701-4feca1c55bca`) |
+| `demo_ceyda_portfolyo_ekle.py` | **Tek kişiye özel, hardcoded UUID:** 2 proje + 2 sertifika daha, 1 eski sertifikayı Arial ile yeniler | **Ceyda Alemdar** (`dea88211-a103-4787-a4b9-0bb95f5a544e`) — full_name hiçbir seed/rename script'inde geçmiyor, muhtemelen gerçek bir web kaydı |
+| `demo_profil_fotolari_yukle.py` / `_2.py` / `_3.py` | Sırasıyla 13/11/15 profile `Downloads\profile pics` klasöründen cinsiyete göre elle eşlenmiş avatar yükler; `_3.py` emoji/özel karakterli dosya adları için `os.scandir` prefix-eşleşmesi kullanıyor | Toplam ~39 isim, tam liste script içinde |
+| `demo_profil_fotolari_yukle_4.py` | Farklı bir klasörden (`Downloads\foto`), kalan avatarsız erkek profilleri doldurur, PNG destekli | Deniz Aydemir, Barış Güneş, Burak Çelik, Yusuf Güler |
 
-## 8. Veritabanı Şeması (Supabase) — Bilinen Tablolar
+**Geliştirici makinesine özel, taşınabilir değil:** `C:\Users\DELL\Downloads\profile pics`, `C:\Users\DELL\Downloads\foto`, `C:\Windows\Fonts` gibi mutlak Windows path'leri — bunlar tek-seferlik kişisel script'ler, deploy edilen serviste yer almıyor, bilerek böyle.
 
-- `profiles` (id, user_type, active_role, full_name, bio, skills[], terms_accepted_at, cv_url, has_verified_patent) — hepsi arayüze bağlı
-- `projects` (id, founder_id, title, raw_idea, generated_prd, required_skills[], status, idea_hash, idea_created_at, payment_type, payment_amount, matched_developers)
-- `portfolio_items` (id, developer_id, title, description, file_url, item_type, issuer, item_date)
-- `project_nda_acceptances`, `project_views` — **arayüze bağlı** (v3'teki "bağlanmadı" bilgisi artık geçersiz), `developer-project-view.tsx` üzerinden
-- `offers` (id, project_id, developer_id, message, proposed_amount, proof_link, payment_type, status, completed_at, github_repo_url) — **teklif sistemi tam çalışıyor** (v3'teki "henüz yapılmadı" bilgisi artık geçersiz): ödeme tipi seçimi (Sabit Ücret/Ortaklık/Esnek), founder Kabul Et/Reddet, `offers-list.tsx` + `payment-section.tsx`
-- `notifications`, `messages` — arayüze bağlı, Supabase Realtime açık
-- `ratings` (id, offer_id, rater_id, rated_user_id, score, comment, unique(offer_id, rater_id)) — `offer.completed_at` set edildikten sonra değerlendirme açılıyor
-- `developer_embeddings` (developer_id, full_name, skills, bio, kaynak_metin, embedding, opsiyonel budget_type/sektor) — eşleştirme motorunun pgvector tablosu
+## 9. `gelistiricileri_toplu_vektorle.py` / `projeleri_toplu_vektorle.py`
 
-RLS tüm tablolarda aktif.
+- `gelistiricileri_toplu_vektorle.py`: `user_type in ["developer", "both"]` filtreli (kod içi yorumda bunun bilerek düzeltildiği not edilmiş — eskiden sadece `"developer"` filtreleniyordu, dual-role hesapları atlıyordu).
+- `projeleri_toplu_vektorle.py`: `status='published'` tüm projeleri `project_embeddings`'e vektörler — önceki dokümantasyonda hiç bahsedilmiyordu.
 
-## 9. AI Servisi (`co-build-ai-server` reposu) — Dosya Envanteri
+## 10. `supabase_migration_*.sql` — 10 Dosyanın Tam Listesi (Önceki Dokümantasyon Sadece 5 Tanesini Biliyordu)
 
-- `main.py` — FastAPI, asenkron PRD üretimi (`/prd-uret-baslat`, `/prd-durum/{id}`), 5 dakikalık timeout, `asyncio.Queue` + arka plan worker
-- `prd_agent.py` — LangGraph self-reflection döngüsü (bkz. Bölüm 4)
-- `matchmaking_engine.py`, `eslestirme_endpoints.py` — eşleştirme motoru (bkz. Bölüm 7)
-- `veri_yukle.py` — startup RAG verisi yükleme (tek seferlik, çalıştırıldı): `sentence-transformers` + ChromaDB (`chroma_data/startup_ornekleri`, ~1500 kayıt, HackerNoon/where-startups-trend, MIT lisanslı)
-- `patent_veri_yukle.py` — patent RAG verisi yükleme (bkz. Bölüm 6)
-- `demo_kullanici_uret.py` + `demo_veri.json`, `demo_zengin_veri_uret.py`, `demo_bos_profil_doldur.py`, `demo_isim_degistir.py`, `demo_patent_arttir.py` — demo/sunum verisi üretme ve düzenleme script'leri (Supabase Admin API ile gerçek auth kullanıcıları)
-- `gelistiricileri_toplu_vektorle.py` — mevcut tüm geliştiricileri toplu olarak `developer_embeddings`'e vektörleyen script
-- `supabase_migration_*.sql` — sırasıyla: metadata_filter (budget_type/sektor), patent_carpan (has_verified_patent), patent_url, starred_developers, banner
+| Dosya | Ne ekliyor |
+|---|---|
+| `supabase_migration_metadata_filter.sql` | `developer_embeddings.budget_type`/`sektor` + `match_developers` RPC'sine filtre parametreleri (fonksiyon overload çakışması için `drop function` notu dahil) |
+| `supabase_migration_patent_carpan.sql` | `profiles.has_verified_patent boolean default false` |
+| `supabase_migration_patent_url.sql` | `profiles.patent_url` + `patent-belgeleri` bucket + RLS (self-upload, admin onayı yok) |
+| `supabase_migration_starred_developers.sql` | `starred_developers` tablosu + RLS (yıldızlama butonu bu olmadan sessizce çalışmıyordu) |
+| `supabase_migration_banner.sql` | `profiles.banner_url` + `banners` bucket RLS |
+| `supabase_migration_patent_title.sql` | `profiles.patent_title` — **önceki dokümantasyonda yoktu** |
+| `supabase_migration_bildirim_gonderen.sql` | `notifications.sender_id` + select politikası — **önceki dokümantasyonda yoktu** |
+| `supabase_migration_proje_disi_davet.sql` | `notifications` insert politikası: `project_id IS NULL` + `type='project_invite'` izni (Doğrudan Arama/Hızlı Eşleştirme'den proje bağlamı olmadan davet) — **önceki dokümantasyonda yoktu** |
+| `supabase_migration_project_embeddings.sql` | `project_embeddings` tablosu + `match_projects` RPC; **kasıtlı olarak vektör indexi yok** (az kayıtta ivfflat yanlış sonuç veriyordu) — **önceki dokümantasyonda yoktu, tüm bir tablo eksikti** |
 
-### ✅ Düzeltildi (2026-09-15): `requirements.txt` ve `README.md`
-`requirements.txt` UTF-16 kodlamasıyla kaydedilmişti (her karakter arasında boşluk, muhtemelen PowerShell `Out-File`/yönlendirme hatası) ve `langchain-openai`/`datasets` paketleri eksikti (`prd_agent.py` ve `patent_veri_yukle.py` bunlara ihtiyaç duyuyor). Yerel `venv`'deki gerçek çalışan `pip freeze` çıktısından UTF-8 olarak yeniden yazıldı; artık kullanılmayan `ollama`/`langchain-ollama` girdileri çıkarıldı. `README.md` de hâlâ eski Ollama mimarisini anlatıyordu — vLLM/RunPod, LangGraph self-reflection döngüsü, eşleştirme motoru ve patent RAG'ı yansıtacak şekilde güncellendi.
+## 11. `requirements.txt` — 2026-09-16'da Gerçekten Düzeltildi
 
-### GitHub Repo
-`github.com/berna1727/co-build-ai-server` (Private). `startups.xlsx` (13MB, ham veri) yanlışlıkla commit edilmiş, temizlenmedi (düşük öncelik).
+**Önceki not "UTF-8'e çevrildi" diyordu ama YANLIŞTI** — dosya hâlâ UTF-16LE'ydi (`aiohappyeyeballs==2.7.1` her karakter arası `\x00` ile). 2026-09-16'da gerçekten UTF-8'e çevrildi VE eksik olan `reportlab==4.2.5` eklendi (tüm `demo_*.py` script'leri `reportlab` kullanıyor ama pakette hiç yoktu — temiz bir `pip install -r requirements.txt` demo script'lerini çalıştıramazdı). **Bir sonraki oturumda bu dosyanın gerçekten UTF-8 kaldığını `file requirements.txt` ile doğrula** — bu ikinci kez "düzeltildi" deniyor.
 
-## 10. Git İş Akışı — ÖNEMLİ DENEYİMLER
+Önemli bağımlılık versiyonları: `fastapi==0.141.1`, `langchain==1.3.15` (+core/community/huggingface/openai), `langgraph==1.2.11`, `chromadb==1.5.9`, `sentence-transformers==6.0.0`, `datasets==2.19.0` (bilerek düşük), `rank-bm25==0.2.2`, `supabase==2.31.0`, `torch==2.13.0`, `transformers==5.15.1`.
 
-- Proje **iki ayrı repo**: `co-build-ai` (esmacakar hesabı, Next.js) ve `co-build-ai-server` (berna1727 hesabı, Python/FastAPI, private)
-- **Merge conflict yaşandı** (Esma'nın yerel dual-role değişiklikleri ile GitHub'daki Claude Code değişiklikleri çakıştı) — `profil/page.tsx`, `projelerim/yururlukte/page.tsx`, `proje/[id]/page.tsx` dosyalarında. Bu tür çakışmalarda Claude Code'un dosyaları okuyup iki tarafı da koruyarak birleştirmesi isteniyor, kullanıcı elle çözmüyor.
-- Rutin: `git pull` (başlamadan önce) → çalış → `git add . && git commit -m "..." && git push`
-- Kullanıcı, Claude Code'a büyük değişiklik yaptırmadan önce commit atma alışkanlığını henüz tam oturtmadı, hatırlatmak faydalı olabilir
+## 12. GitHub Repo
 
-## 11. Bilinçli Olarak v2'ye Ertelenen Özellikler
+`github.com/berna1727/co-build-ai-server` (Private). `startups.xlsx` (13MB, ham veri) hâlâ commit'li, temizlenmedi (düşük öncelik). `chroma_data/` ve `venv/` çalışma ağacında mevcut — `.gitignore` kapsamını yeni bir push öncesi kontrol et.
 
-- Biyometrik KYC, Stripe/escrow gerçek ödeme (para transferi/escrow yok)
-- NDA dijital imza
-- Tinder-tarzı swipe eşleştirme (kesin olarak vazgeçildi)
-- GitHub commit'e göre otomatik milestone/ödeme tetikleme
-- Platform içi kod editörü/sandbox
-- Gerçek zamanlı canlı web/rakip taraması
-- Mobil uygulama
-- Tam kapsamlı, resmi patent ofisi entegrasyonu (Bölüm 6'daki statik veri setli prototip bunun yerine MVP kapsamında)
+## 13. Git Geçmişi Özeti
 
-## 12. Bilinen Riskler (RunPod/AI dışında)
-
-- `.env.local`'deki `NEXT_PUBLIC_AI_SERVICE_URL` (web) ve `.env`'deki `VLLM_BASE_URL` (server), Pod yeniden deploy edilince değişir — ikisi de güncellenmezse istekler sessizce başarısız olabilir
-- RunPod Pod kapalıyken PRD üretimi bekleyen bir proje sonsuza kadar "PRD hazırlanıyor" gösterir (sessizce retry eder, kullanıcıya hata göstermez)
-
-## 13. Claude Code İçin Genel Yaklaşım
-
-Bu proje, kod tabanının kullanıcının hafızasından ileride olduğu bir noktaydı — v4 revizyonuyla bu doküman kodla senkronize edildi, ama proje hızlı ilerliyor. Yeni bir işe başlamadan önce:
-1. Mevcut dosyaları oku, bu dokümana körü körüne güvenme — özellikle "TAMAMLANDI" denen bölümlerin de zamanla değişmiş olabileceğini unutma
-2. Belirsizlik varsa kullanıcıya "şu an X dosyası şöyle görünüyor, bu senin beklediğin gibi mi?" diye doğrulat
-3. İki repo arasında geçiş yaparken (`co-build-ai` / `co-build-ai-server`) hangi repoda olduğunu netleştir — env değişkenleri, dosya yapıları ve git hesapları farklı
+Toplam **17 commit** var (2026-09-16 itibarıyla, `git log --oneline | wc -l` ile doğrulandı — önceki bir oturumda yanlışlıkla "40" denmişti). Repo Ollama+RAG basit bir FastAPI servisi olarak başladı, sonra README/secret temizliği, sonra "model büyümeye gitti" (LangGraph/hibrit arama/patent RAG eklendi), en son iki commit demo veri cilası: placeholder hesap isimlerini gerçekçi isimlere çevirme + dual-role vektörleme filtresini düzeltme + davet/patent altyapısını tamamlama. Yani **şu an aktif iş, yeni özellik geliştirme değil, sunum/demo cilası ve zaten var olan özelliklerdeki boşlukları kapatma** aşamasında.
 
 ## 14. Kod Tarzı Notları
 
-- Next.js App Router yapısı, client component'ler `"use client"` ile başlıyor
-- Tailwind renkleri `globals.css`'te `@theme` bloğunda
-- Python tarafında Türkçe fonksiyon/değişken isimleri (`benzer_ornekleri_bul`, `patent_cakismasi_kontrol_et` gibi)
-- `.env` üzerinden okunan değerler `os.getenv()` ile, path'ler hardcode edilmiyor
-- Kod yorumları Türkçe
-- Sunucu tarafı, gizli anahtar gerektiren işlemler (web) `app/api/*/route.ts` altında (`SUPABASE_SERVICE_ROLE_KEY` asla client'a gitmiyor)
+- Python tarafında Türkçe fonksiyon/değişken isimleri (`benzer_ornekleri_bul`, `patent_cakismasi_kontrol_et` gibi), kod yorumları Türkçe.
+- `.env` üzerinden okunan değerler `os.getenv()` ile — RunPod'a özgü HİÇBİR env değişkeni kodda yok, sadece jenerik `VLLM_*`.
+- Demo/tek-seferlik script'lerdeki hardcoded Windows path'leri ve UUID'ler bilinçli — taşınabilir olmaları beklenmiyor.
