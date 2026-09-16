@@ -36,10 +36,14 @@ from matchmaking_engine import (
     AramaHatasi,
     EslesmeSonucu,
     GelistiriciProfili,
+    ProjeEslesmeSonucu,
+    ProjeProfili,
     VektorlemeHatasi,
     en_uygun_gelistiricileri_bul,
+    en_uygun_projeleri_bul,
     gelistirici_profilini_vektorle,
     hibrit_eslestirme_yap,
+    proje_profilini_vektorle,
 )
 
 logger = logging.getLogger("cobuild.matchmaking.api")
@@ -115,6 +119,49 @@ class EslesmeSonucuYaniti(BaseModel):
 class AramaYaniti(BaseModel):
     sonuc_sayisi: int
     yazilimcilar: list[EslesmeSonucuYaniti]
+
+
+class ProjeVektorleIstek(BaseModel):
+    project_id: str = Field(..., description="projects.id (uuid)")
+    title: str
+    generated_prd: str = Field(default="", description="Varsa üretilen PRD (tercih edilen kaynak metin)")
+    raw_idea: str = Field(default="", description="PRD henüz yoksa ham fikir metni")
+    required_skills: list[str] = Field(default_factory=list)
+
+
+class ProjeVektorleYanit(BaseModel):
+    basarili: bool
+    mesaj: str
+
+
+class ProjeSemantikAramaIstek(BaseModel):
+    sorgu_metni: str = Field(..., min_length=1, description="Yazılımcının aradığı proje türünü tarif eden serbest metin")
+    top_k: int = Field(default=5, ge=1, le=50)
+
+
+class ProjeEslesmeSonucuYaniti(BaseModel):
+    project_id: str
+    title: str
+    required_skills: list[str]
+    ozet: str
+    benzerlik_skoru: float
+    uyum_skoru: int | None = None
+
+    @classmethod
+    def from_dataclass(cls, sonuc: ProjeEslesmeSonucu) -> "ProjeEslesmeSonucuYaniti":
+        return cls(
+            project_id=sonuc.project_id,
+            title=sonuc.title,
+            required_skills=sonuc.required_skills,
+            ozet=sonuc.ozet,
+            benzerlik_skoru=sonuc.benzerlik_skoru,
+            uyum_skoru=sonuc.uyum_skoru,
+        )
+
+
+class ProjeAramaYaniti(BaseModel):
+    sonuc_sayisi: int
+    projeler: list[ProjeEslesmeSonucuYaniti]
 
 
 # ============================================================================
@@ -219,6 +266,73 @@ def hibrit_arama_endpoint(istek: HibritAramaIstek) -> AramaYaniti:
 
     except Exception as exc:
         logger.exception("Hibrit arama endpoint'inde beklenmeyen hata.")
+        raise HTTPException(
+            status_code=500, detail="Sunucu tarafında beklenmeyen bir hata oluştu."
+        ) from exc
+
+
+# ============================================================================
+# Endpoint 4: Proje Vektörleme
+# ============================================================================
+
+@router.post("/proje/vektorle", response_model=ProjeVektorleYanit)
+def proje_vektorle_endpoint(istek: ProjeVektorleIstek) -> ProjeVektorleYanit:
+    """
+    Bir proje yayınlandığında (ya da PRD'si güncellendiğinde) çağrılır.
+    Aynı project_id ile tekrar çağrılırsa mevcut kaydı GÜNCELLER (upsert).
+    """
+    try:
+        proje = ProjeProfili(
+            project_id=istek.project_id,
+            title=istek.title,
+            generated_prd=istek.generated_prd,
+            raw_idea=istek.raw_idea,
+            required_skills=istek.required_skills,
+        )
+        proje_profilini_vektorle(proje)
+        return ProjeVektorleYanit(
+            basarili=True,
+            mesaj=f"'{istek.title}' başarıyla vektörlendi.",
+        )
+
+    except VektorlemeHatasi as exc:
+        logger.warning("Proje vektörleme reddedildi: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except Exception as exc:
+        logger.exception("Proje vektörleme endpoint'inde beklenmeyen hata.")
+        raise HTTPException(
+            status_code=500, detail="Sunucu tarafında beklenmeyen bir hata oluştu."
+        ) from exc
+
+
+# ============================================================================
+# Endpoint 5: Top 5 Semantik Proje Araması
+# ============================================================================
+
+@router.post("/eslestir/proje-top5", response_model=ProjeAramaYaniti)
+def proje_semantik_arama_endpoint(istek: ProjeSemantikAramaIstek) -> ProjeAramaYaniti:
+    """
+    Bir yazılımcının "ne tür bir projede çalışmak istediğini" anlatan serbest
+    metnini alır, embedding'e çevirir, pgvector'de kosinüs benzerliğine göre
+    en yakın top_k YAYINLANMIŞ projeyi döner (saf semantik arama).
+    """
+    try:
+        sonuclar = en_uygun_projeleri_bul(
+            sorgu_metni=istek.sorgu_metni,
+            top_k=istek.top_k,
+        )
+        return ProjeAramaYaniti(
+            sonuc_sayisi=len(sonuclar),
+            projeler=[ProjeEslesmeSonucuYaniti.from_dataclass(s) for s in sonuclar],
+        )
+
+    except AramaHatasi as exc:
+        logger.warning("Semantik proje araması reddedildi: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except Exception as exc:
+        logger.exception("Semantik proje araması endpoint'inde beklenmeyen hata.")
         raise HTTPException(
             status_code=500, detail="Sunucu tarafında beklenmeyen bir hata oluştu."
         ) from exc

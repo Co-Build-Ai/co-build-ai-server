@@ -151,6 +151,36 @@ class EslesmeSonucu:
     uyum_skoru: Optional[int] = None  # 0-100, arayüzde gösterilecek "Uyum Skoru" — bkz. uyum_skorlarini_hesapla_ve_ata
 
 
+@dataclass
+class ProjeProfili:
+    """Vektörlenecek proje ilanını temsil eder (bkz. GelistiriciProfili'nin proje karşılığı)."""
+    project_id: str            # projects.id (uuid, string olarak)
+    title: str
+    generated_prd: str = ""    # varsa üretilen PRD (tercih edilen kaynak metin)
+    raw_idea: str = ""         # PRD henüz yoksa ham fikir metni
+    required_skills: list[str] = field(default_factory=list)
+
+    def embedding_metnine_donustur(self) -> str:
+        """Proje alanlarını embedding modeline verilecek TEK bir metne birleştirir."""
+        parcalar = [
+            f"Başlık: {self.title}." if self.title else "",
+            f"Gerekli beceriler: {', '.join(self.required_skills)}." if self.required_skills else "",
+            f"Açıklama: {self.generated_prd or self.raw_idea}" if (self.generated_prd or self.raw_idea) else "",
+        ]
+        return " ".join(p for p in parcalar if p).strip()
+
+
+@dataclass
+class ProjeEslesmeSonucu:
+    """Bir proje arama sonucundaki tek bir eşleşmeyi temsil eder."""
+    project_id: str
+    title: str
+    required_skills: list[str]
+    ozet: str                       # kısa açıklama (arayüzde snippet olarak gösterilecek)
+    benzerlik_skoru: float          # 0-1 arası, saf semantik benzerlik (kosinüs)
+    uyum_skoru: Optional[int] = None  # 0-100, arayüzde gösterilecek "Uyum Skoru"
+
+
 def uyum_skorlarini_hesapla_ve_ata(sonuclar: list["EslesmeSonucu"]) -> list["EslesmeSonucu"]:
     """
     Her sonuca, arayüzde doğrudan gösterilebilecek 0-100 arası bir "Uyum Skoru" atar.
@@ -412,6 +442,111 @@ def en_uygun_gelistiricileri_bul(
     except Exception as exc:
         logger.exception("Semantik arama sırasında beklenmeyen hata.")
         raise AramaHatasi(f"Semantik arama başarısız oldu: {exc}{_migration_ipucu(exc)}") from exc
+
+
+# ============================================================================
+# 2b) PROJE VEKTÖRLEME + SEMANTİK PROJE ARAMASI
+# ============================================================================
+# Yazılımcı tarafındaki "Doğrudan Arama" paneli için: geliştirici bir yazıyla
+# ne tür bir projede çalışmak istediğini tarif ediyor, biz bunu embedding'e
+# çevirip YAYINLANMIŞ projeler arasında en yakınlarını buluyoruz. Mimari,
+# yukarıdaki geliştirici vektörleme/arama çiftinin (developer_embeddings /
+# match_developers) birebir aynısı — sadece rolü ters çevrilmiş hâli
+# (project_embeddings / match_projects).
+# ============================================================================
+
+def proje_profilini_vektorle(proje: ProjeProfili) -> bool:
+    """
+    Bir proje ilanını embedding'e çevirir ve Supabase'e (project_embeddings
+    tablosu) kaydeder/günceller (upsert). Proje yayınlandığında (ya da PRD'si
+    düzenlendiğinde) çağrılması beklenir — bkz. web tarafında PublishForm.
+    """
+    try:
+        kaynak_metin = proje.embedding_metnine_donustur()
+        if not kaynak_metin:
+            raise VektorlemeHatasi(
+                f"'{proje.title}' için embedding'e çevrilecek yeterli bilgi yok "
+                "(başlık, PRD/ham fikir veya gerekli beceri alanlarından en az biri dolu olmalı)."
+            )
+
+        vektor = _metni_embeddinge_cevir(kaynak_metin)
+
+        if len(vektor) != EMBEDDING_BOYUTU:
+            raise VektorlemeHatasi(
+                f"Beklenmeyen embedding boyutu: {len(vektor)} (beklenen {EMBEDDING_BOYUTU})."
+            )
+
+        kayit = {
+            "project_id": proje.project_id,
+            "title": proje.title,
+            "required_skills": proje.required_skills,
+            "kaynak_metin": kaynak_metin,
+            "embedding": vektor,
+        }
+
+        supabase = _supabase_client_getir()
+        supabase.table("project_embeddings").upsert(
+            kayit,
+            on_conflict="project_id",
+        ).execute()
+
+        logger.info("Proje vektörlendi: %s (%s)", proje.title, proje.project_id)
+        return True
+
+    except EslestirmeMotoruHatasi:
+        raise
+    except Exception as exc:
+        logger.exception("Proje vektörlenirken beklenmeyen hata: %s", proje.project_id)
+        raise VektorlemeHatasi(f"Proje vektörleme başarısız oldu: {exc}{_migration_ipucu(exc)}") from exc
+
+
+def en_uygun_projeleri_bul(
+    sorgu_metni: str,
+    top_k: int = VARSAYILAN_TOP_K,
+) -> list[ProjeEslesmeSonucu]:
+    """
+    Bir yazılımcının "ne tür bir projede çalışmak istediğini" anlatan serbest
+    metnini embedding'e çevirir ve pgvector'de kosinüs benzerliğine göre en
+    yakın top_k YAYINLANMIŞ projeyi döner (saf semantik arama).
+
+    Dönüş
+    -----
+    list[ProjeEslesmeSonucu]: Benzerliğe göre azalan sırada, en fazla top_k eleman.
+                              Eşleşme yoksa boş liste döner (hata değil).
+    """
+    try:
+        if not sorgu_metni or not sorgu_metni.strip():
+            raise AramaHatasi("Arama metni boş olamaz.")
+
+        sorgu_vektoru = _metni_embeddinge_cevir(sorgu_metni)
+        supabase = _supabase_client_getir()
+
+        yanit = supabase.rpc(
+            "match_projects",
+            {"query_embedding": sorgu_vektoru, "match_count": top_k},
+        ).execute()
+
+        sonuclar = [
+            ProjeEslesmeSonucu(
+                project_id=satir["project_id"],
+                title=satir["title"],
+                required_skills=satir["required_skills"] or [],
+                ozet=(satir.get("kaynak_metin") or "")[:280],
+                benzerlik_skoru=round(float(satir["benzerlik"]), 4),
+            )
+            for satir in (yanit.data or [])
+        ]
+        for s in sonuclar:
+            s.uyum_skoru = round(max(0.0, min(1.0, s.benzerlik_skoru)) * 100)
+
+        logger.info("Semantik proje araması tamamlandı: %d sonuç bulundu.", len(sonuclar))
+        return sonuclar
+
+    except EslestirmeMotoruHatasi:
+        raise
+    except Exception as exc:
+        logger.exception("Semantik proje araması sırasında beklenmeyen hata.")
+        raise AramaHatasi(f"Semantik proje araması başarısız oldu: {exc}{_migration_ipucu(exc)}") from exc
 
 
 # ============================================================================
